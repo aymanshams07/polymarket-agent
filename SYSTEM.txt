@@ -1,0 +1,252 @@
+POLYMARKET AI PLATFORM — SYSTEM OVERVIEW
+=========================================
+
+What it does
+------------
+A web application that pulls live prediction market data from Polymarket,
+displays it in a dashboard, and lets you run a 5-agent AI debate on any
+market to get an independent probability forecast — with streaming output
+so you can watch the agents reason in real time.
+
+
+INFRASTRUCTURE
+==============
+
+Four Docker services talk to each other on a shared network:
+
+  postgres  — stores market data (prices, volume, metadata)
+  qdrant    — vector database for news article embeddings
+  backend   — FastAPI Python server (the brain)
+  frontend  — Next.js React app (the face)
+
+Startup order: postgres and qdrant must pass health checks before the
+backend starts. The frontend waits for the backend to be healthy.
+
+
+DATA LAYER — HOW MARKET DATA GETS IN
+=====================================
+
+On backend startup, two background tasks launch:
+
+1. Market Poller (runs every 30 seconds)
+   - Calls the Polymarket Gamma API (gamma-api.polymarket.com)
+   - Parses each market: extracts YES/NO prices from the JSON string
+     "outcomePrices" field, derives a category via keyword matching
+     (Crypto / Politics / Sports / Finance / Science & Tech / Other)
+   - Upserts all markets into Postgres with ON CONFLICT DO UPDATE
+   - Compares new prices to previous prices; if anything changed,
+     broadcasts a WebSocket message to all connected browsers
+
+2. News Ingester (starts after 60s delay, then runs every 15 minutes)
+   - Skips silently if TAVILY_API_KEY is not set
+   - Takes the top 20 markets by volume
+   - For each market, calls Tavily (a search API) with the market question
+   - Embeds the returned articles with fastembed (BAAI/bge-small-en-v1.5,
+     a 384-dimension local model — no external API needed for embeddings)
+   - Upserts article vectors into Qdrant, tagged with condition_id
+   - Uses MD5(url) as the vector ID so re-ingesting is idempotent
+
+
+FRONTEND DASHBOARD
+==================
+
+The home page (/) shows a live grid of all active markets.
+
+  useMarkets hook — fetches the market list from GET /api/v1/markets
+    via SWR (stale-while-revalidate). Supports filtering by category,
+    text search, and sorting by volume or price change.
+
+  useMarketSocket hook — opens a WebSocket to ws://localhost:8000/ws/markets
+    The backend sends two message types:
+      "snapshot" — full list of current prices on connect
+      "price_update" — delta of changed prices every 30 seconds
+    When a price_update arrives, the hook patches the SWR cache directly
+    (mutate with revalidate=false) so the UI updates instantly without
+    a refetch. Cards flash amber briefly when their price changes.
+
+Clicking a market card opens /market/{condition_id}.
+
+
+MARKET DETAIL PAGE
+==================
+
+Loads the specific market via GET /api/v1/markets/{id}.
+
+Shows a ticker bar (YES%, NO%, 24h change, volume, days to close)
+and a two-column layout:
+  Left  — Run button + AI results (Forecast Card)
+  Right — Agent Pipeline timeline
+
+
+THE AI PIPELINE
+===============
+
+The pipeline is a LangGraph StateGraph. Five nodes run sequentially:
+
+  market_analysis → news_retrieval → bullish → bearish → judge
+
+State flows through as a TypedDict. Each node reads from the state,
+calls an LLM, and writes its structured output back into the state.
+The next node can see all previous outputs.
+
+NODE 1: Market Analysis
+  Model: Claude claude-sonnet-4-6, temperature 0.2 (low = factual)
+  Input: market question, yes_price, no_price, volume, liquidity,
+         24h price change, days until close, category, event title
+  Output (Pydantic schema — MarketAnalysis):
+    summary, key_factors_yes[], key_factors_no[],
+    market_implied_probability, analyst_probability, reasoning
+  Role: objective first-pass assessment, no advocacy
+
+NODE 2: News Retrieval
+  Model: Claude claude-sonnet-4-6, temperature 0.2
+  Input: market question + the MarketAnalysis from Node 1
+  Process:
+    1. Builds a search query from the question
+    2. Calls Qdrant to find the top 6 semantically similar articles
+       (filtered to this market's condition_id if available)
+    3. Passes article snippets to the LLM for synthesis
+  Output (Pydantic schema — NewsSummary):
+    items[], overall_sentiment, key_insights[],
+    summary, news_adjusted_probability
+  Role: ground the debate in real-world news context
+
+NODE 3: Bullish Argument
+  Model: Claude claude-sonnet-4-6, temperature 0.4 (higher = more creative)
+  Input: question + MarketAnalysis + NewsSummary
+  Output (Pydantic schema — DebateArgument):
+    position="YES", opening_statement, main_arguments[],
+    evidence[], rebuttals=[], probability_estimate, confidence
+  Role: make the strongest possible case for YES
+
+NODE 4: Bearish Argument
+  Model: Claude claude-sonnet-4-6, temperature 0.4
+  Input: everything above PLUS the full BullishArgument
+  Output: same DebateArgument schema but for NO
+  Role: make the strongest case for NO and directly rebut the bullish
+        arguments (this is why it runs after bullish, not in parallel)
+
+NODE 5: Judge
+  Model: Claude claude-sonnet-4-6, temperature 0.1 (very low = deliberate)
+  Input: all four previous outputs
+  Output (Pydantic schema — JudgeVerdict):
+    final_probability, reasoning, stronger_side,
+    decisive_factors[], confidence_level, market_vs_ai, recommendation
+  Role: weigh both sides impartially, produce a calibrated final estimate
+
+Structured outputs work via Claude's tool_use feature. The LLM is forced
+to call a "tool" whose arguments match the Pydantic schema exactly.
+This guarantees valid JSON with all required fields — no parsing needed.
+
+
+HOW STREAMING WORKS (SSE)
+=========================
+
+When you click "Run AI Analysis", the frontend opens an EventSource
+(Server-Sent Events connection) to:
+
+  GET /api/v1/forecast/stream/{condition_id}
+
+The backend runs the LangGraph graph with astream_events(version="v2"),
+which yields a stream of events as each node and LLM call progresses.
+
+The backend maps these low-level events to a clean protocol:
+
+  {"event": "run_start",     "run_id": "...", "question": "..."}
+  {"event": "node_start",    "node": "market_analysis", "label": "..."}
+  {"event": "token",         "node": "market_analysis", "content": "..."}
+      (one event per streamed text token from the LLM)
+  {"event": "node_complete", "node": "market_analysis", "data": {...}}
+  ... repeated for each node ...
+  {"event": "done",          "run_id": "...", "result": {...}}
+
+Token events stream the LLM's pre-tool-call reasoning text (the "thinking
+out loud" before it commits to structured output). Tool-call argument
+chunks (raw JSON fragments) are filtered out — only human-readable text
+is streamed.
+
+The final result is built from the accumulated node outputs collected
+during streaming — the graph is NOT run a second time.
+
+On the frontend, the useDebateStream hook maintains a state machine:
+  idle → running → complete (or error)
+
+It patches the agents Record on each event so the timeline updates live.
+
+
+AGENT TIMELINE UI
+==================
+
+The right column shows a vertical timeline of all 5 nodes.
+
+Each step has:
+  - A status dot: dark (idle) / pulsing blue (running) / green (done)
+  - The node label and a one-line description of what it does
+  - A progress bar across the top showing completed/total
+  - While running: a live text box showing streamed tokens with a blinking
+    cursor
+  - When done: click to expand and re-read the full streamed output
+
+
+FORECAST RESULT CARD
+=====================
+
+After all nodes complete, the left column shows the ForecastCard:
+
+  - Large AI probability (e.g. "67%") vs market price (e.g. "58%")
+  - Two probability bars for visual comparison
+  - A delta badge: "▲ +9pp AI sees upside" or "▼ -5pp AI sees downside"
+  - A confidence badge (low / medium / high)
+  - If |diff| ≥ 2pp: a mispricing alert box
+  - The judge's decisive factors (numbered list)
+  - The judge's full reasoning paragraph
+  - A recommendation (actionable for a market participant)
+  - Two ArgumentCards side by side: YES case vs NO case, with the
+    stronger side highlighted in green or red
+  - News context: sentiment, summary, key insights from the RAG step
+
+
+API ENDPOINTS
+=============
+
+  GET  /health                          — liveness check
+  GET  /health/ready                    — readiness (tests DB connection)
+
+  GET  /api/v1/markets                  — list markets (filter, sort, page)
+  GET  /api/v1/markets/{condition_id}   — single market detail
+
+  GET  /api/v1/forecast/stream/{id}     — SSE stream (main AI endpoint)
+  POST /api/v1/forecast                 — synchronous version (waits ~60-90s)
+
+  GET  /api/v1/rag/search               — search news articles directly
+  POST /api/v1/rag/ingest/{id}          — manually trigger news ingest
+
+  WS   /ws/markets                      — WebSocket for live price updates
+
+
+KEY DESIGN DECISIONS
+====================
+
+Sequential debate (not parallel)
+  The bearish agent reads the bullish argument before writing its own.
+  This produces targeted rebuttals rather than two independent monologues.
+
+Local embeddings (fastembed)
+  No external API call needed for embedding. The BAAI/bge-small-en-v1.5
+  model (~70MB) is pre-downloaded during Docker image build and runs
+  in a thread-pool executor to avoid blocking the async event loop.
+
+Accumulate-then-build (no double invocation)
+  The SSE handler collects node outputs from on_chain_end events during
+  the single graph run, then builds the final DebateResult at the end.
+  Earlier versions ran the graph twice (once to stream, once to get the
+  result) which was slow and expensive.
+
+Deterministic vector IDs
+  Qdrant point IDs are MD5(url) cast to UUID. Re-ingesting the same
+  article URL is a safe upsert, never a duplicate insert.
+
+Pydantic everywhere
+  LLM output schemas → LangGraph state → FastAPI response models →
+  TypeScript interfaces. The same field names flow through the entire
+  stack so there is no translation layer to maintain.

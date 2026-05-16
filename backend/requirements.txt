@@ -1,0 +1,35 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# Vector DB
+qdrant-client==1.12.1
+fastembed==0.3.6
+
+# AI / LangGraph
+anthropic>=0.40.0
+langgraph>=0.2.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+langchain-anthropic>=0.3.0,<0.4.0
+
+# HTTP client
+httpx==0.28.1
+
+# Config / validation
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# Utilities
+tenacity==9.0.0
+python-dotenv==1.0.1
+structlog==24.4.0
+
+# Dev/test
+pytest==8.3.4
+pytest-asyncio==0.24.0
