@@ -1,5 +1,8 @@
 # Env
 .env
+
+# Local only
+career_packaging.md
 .env.local
 .env.*.local
 
